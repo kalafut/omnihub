@@ -1,3 +1,8 @@
+> [!NOTE]
+> **Slop disclaimer**: this is 100% Claude's work, but it works well!
+
+
+
 # omnihub
 
 An OmniFocus plug-in that pulls GitHub issues into OmniFocus so you can order,
