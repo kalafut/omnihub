@@ -1,0 +1,9 @@
+{
+  "name": "omnihub",
+  "private": true,
+  "description": "OmniFocus plug-in that pulls labeled GitHub issues into per-repo projects",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "install-plugin": "sh install.sh"
+  }
+}

@@ -1,0 +1,347 @@
+/*{
+	"type": "action",
+	"targets": ["omnifocus"],
+	"author": "kalafut",
+	"identifier": "com.github.kalafut.omnihub",
+	"version": "0.1",
+	"description": "Pull labeled GitHub issues into OmniFocus, one project per repository. One-way: GitHub owns titles and open/closed state; OmniFocus owns everything else.",
+	"label": "Sync GitHub Issues",
+	"shortLabel": "Sync GitHub",
+	"paletteLabel": "Sync GitHub Issues",
+	"image": "arrow.triangle.2.circlepath"
+}*/
+(() => {
+	// ---------------------------------------------------------------------
+	// Configuration
+	// ---------------------------------------------------------------------
+	const CONFIG = {
+		// Only open issues carrying this GitHub label are pulled in.
+		label: "omnifocus",
+
+		// Optional allowlist of "owner/repo" names. Empty means any repo the
+		// token can see.
+		repos: [],
+
+		// Tag applied to every task this plug-in creates. Only tasks with this
+		// tag are ever renamed/completed/dropped by the sync. Add the tag to an
+		// existing task (whose note starts with an issue URL) to adopt it.
+		tag: "GitHub",
+
+		// Folder for newly created repo projects. When empty, new projects go
+		// next to existing synced projects (so once you move them into a
+		// folder, new repos follow), or to the top level if there are none.
+		newProjectFolder: "",
+
+		// Show a summary alert after a successful sync. Set to false if you
+		// run the sync from a Shortcuts automation.
+		showSummary: true,
+	};
+
+	const API = "https://api.github.com";
+	const CREDENTIAL_SERVICE = "omnihub-github";
+
+	// Credentials must be created while the plug-in loads.
+	const credentials = new Credentials();
+
+	// ---------------------------------------------------------------------
+	// Identity helpers
+	//
+	// Tasks are identified by an issue URL on the FIRST line of their note;
+	// projects by a repo URL on the first line of theirs. Keys are lowercase
+	// ("owner/repo#123", "owner/repo") because GitHub names are
+	// case-insensitive.
+	// ---------------------------------------------------------------------
+	const ISSUE_RE = /^\s*https:\/\/github\.com\/([^\/\s]+)\/([^\/\s]+)\/issues\/(\d+)(?![\w])/i;
+	const REPO_RE = /^\s*https:\/\/github\.com\/([^\/\s]+)\/([^\/\s?#]+?)\/?\s*$/i;
+
+	function firstLine(text) {
+		return String(text || "").split(/\r?\n/, 1)[0];
+	}
+
+	function issueKeyFromText(text) {
+		const m = ISSUE_RE.exec(firstLine(text));
+		return m ? `${m[1]}/${m[2]}#${m[3]}`.toLowerCase() : null;
+	}
+
+	function repoKeyFromText(text) {
+		const m = REPO_RE.exec(firstLine(text));
+		return m ? `${m[1]}/${m[2]}`.toLowerCase() : null;
+	}
+
+	function repoOfIssueKey(key) {
+		return key.split("#")[0];
+	}
+
+	// ---------------------------------------------------------------------
+	// GitHub client
+	// ---------------------------------------------------------------------
+	class AuthError extends Error {}
+
+	function nextLink(headers) {
+		for (const name in headers || {}) {
+			if (name.toLowerCase() === "link") {
+				const m = /<([^>]+)>;\s*rel="next"/.exec(headers[name]);
+				return m ? m[1] : null;
+			}
+		}
+		return null;
+	}
+
+	function makeGitHub(token) {
+		async function get(url) {
+			const req = URL.FetchRequest.fromString(url);
+			req.method = "GET";
+			req.headers = {
+				"Authorization": `Bearer ${token}`,
+				"Accept": "application/vnd.github+json",
+				"X-GitHub-Api-Version": "2022-11-28",
+				"User-Agent": "omnihub",
+			};
+			const resp = await req.fetch();
+			if (resp.statusCode === 401) {
+				throw new AuthError("GitHub rejected the token (401).");
+			}
+			return resp;
+		}
+
+		function failure(resp, what) {
+			let detail = "";
+			try { detail = JSON.parse(resp.bodyString).message || ""; } catch (e) { /* not JSON */ }
+			return new Error(`GitHub ${what} failed (${resp.statusCode})${detail ? ": " + detail : ""}`);
+		}
+
+		return {
+			// All open issues (not PRs) with the configured label, oldest first.
+			async labeledIssues() {
+				const params = [
+					"filter=all",
+					"state=open",
+					`labels=${encodeURIComponent(CONFIG.label)}`,
+					"sort=created",
+					"direction=asc",
+					"per_page=100",
+				].join("&");
+				let url = `${API}/issues?${params}`;
+				const issues = [];
+				while (url) {
+					const resp = await get(url);
+					if (resp.statusCode !== 200) throw failure(resp, "issue list");
+					for (const item of JSON.parse(resp.bodyString)) {
+						if (!item.pull_request) issues.push(item);
+					}
+					url = nextLink(resp.headers);
+				}
+				return issues;
+			},
+
+			// One issue by key, or null if it no longer exists / isn't visible.
+			async issue(key) {
+				const m = /^([^\/]+)\/([^#]+)#(\d+)$/.exec(key);
+				const resp = await get(`${API}/repos/${m[1]}/${m[2]}/issues/${m[3]}`);
+				if (resp.statusCode === 404 || resp.statusCode === 410) return null;
+				if (resp.statusCode !== 200) throw failure(resp, `fetch of ${key}`);
+				return JSON.parse(resp.bodyString);
+			},
+		};
+	}
+
+	// ---------------------------------------------------------------------
+	// Sync
+	// ---------------------------------------------------------------------
+	function isActive(task) {
+		const s = task.taskStatus;
+		return s !== Task.Status.Completed && s !== Task.Status.Dropped;
+	}
+
+	function hasTag(task, tag) {
+		// Compare by primary key; bridged objects aren't guaranteed to be ===.
+		const id = tag.id.primaryKey;
+		return task.tags.some(t => t.id.primaryKey === id);
+	}
+
+	function allowedRepo(repoKey) {
+		return CONFIG.repos.length === 0 ||
+			CONFIG.repos.some(r => r.toLowerCase() === repoKey);
+	}
+
+	function findOrCreateTag(name) {
+		return flattenedTags.byName(name) || new Tag(name);
+	}
+
+	function projectLocation(projectsByRepo) {
+		if (CONFIG.newProjectFolder) {
+			const folder = flattenedFolders.byName(CONFIG.newProjectFolder);
+			if (folder) return folder.ending;
+		}
+		for (const project of projectsByRepo.values()) {
+			if (project.parentFolder) return project.parentFolder.ending;
+		}
+		return null;
+	}
+
+	async function sync(gh) {
+		const stats = {
+			projectsCreated: [],
+			created: 0,
+			renamed: 0,
+			completed: 0,
+			dropped: 0,
+			unlabeled: 0,     // synced task whose issue is open but no longer labeled
+			missing: 0,       // synced task whose issue 404s
+			untracked: 0,     // labeled issue already linked from a non-synced task
+		};
+
+		// --- Index OmniFocus -------------------------------------------------
+		const tag = findOrCreateTag(CONFIG.tag);
+
+		// Every task whose note starts with an issue URL blocks a duplicate,
+		// but only tagged tasks are managed (renamed/completed/dropped).
+		const tasksByKey = new Map();
+		flattenedTasks.forEach(task => {
+			const key = issueKeyFromText(task.note);
+			if (!key) return;
+			const prev = tasksByKey.get(key);
+			// Prefer a managed task if there are several for the same issue.
+			if (!prev || (!hasTag(prev, tag) && hasTag(task, tag))) tasksByKey.set(key, task);
+		});
+
+		const projectsByRepo = new Map();
+		flattenedProjects.forEach(project => {
+			const key = repoKeyFromText(project.note);
+			if (key && !projectsByRepo.has(key)) projectsByRepo.set(key, project);
+		});
+
+		// --- Gather everything from GitHub before touching OmniFocus ---------
+		// A network failure part-way through leaves the database untouched.
+		const labeled = (await gh.labeledIssues())
+			.map(issue => ({ issue, key: issueKeyFromText(issue.html_url) }))
+			.filter(({ key }) => key && allowedRepo(repoOfIssueKey(key)));
+		const labeledKeys = new Set(labeled.map(x => x.key));
+
+		const stale = [];
+		for (const [key, task] of tasksByKey) {
+			if (labeledKeys.has(key) || !isActive(task) || !hasTag(task, tag)) continue;
+			stale.push({ task, issue: await gh.issue(key) });
+		}
+
+		// --- Apply ------------------------------------------------------------
+		for (const { issue, key } of labeled) {
+			const existing = tasksByKey.get(key);
+			if (existing) {
+				if (!hasTag(existing, tag)) {
+					stats.untracked++;
+				} else if (isActive(existing) && existing.name !== issue.title) {
+					existing.name = issue.title;
+					stats.renamed++;
+				}
+				// Completed/dropped tasks are never resurrected.
+				continue;
+			}
+
+			const repoKey = repoOfIssueKey(key);
+			let project = projectsByRepo.get(repoKey);
+			if (!project) {
+				const location = projectLocation(projectsByRepo);
+				project = location
+					? new Project(issue.repository.name, location)
+					: new Project(issue.repository.name);
+				project.note = `${issue.repository.html_url}\n`;
+				projectsByRepo.set(repoKey, project);
+				stats.projectsCreated.push(issue.repository.full_name);
+			}
+
+			const task = new Task(issue.title, project.ending);
+			task.note = `${issue.html_url}\n`;
+			task.addTag(tag);
+			tasksByKey.set(key, task);
+			stats.created++;
+		}
+
+		for (const { task, issue } of stale) {
+			if (!issue) {
+				stats.missing++;
+			} else if (issue.state === "closed") {
+				if (issue.state_reason === "not_planned") {
+					task.drop(false);
+					stats.dropped++;
+				} else {
+					task.markComplete();
+					stats.completed++;
+				}
+			} else {
+				stats.unlabeled++;
+			}
+		}
+
+		return stats;
+	}
+
+	function summarize(stats) {
+		const lines = [];
+		const add = (n, text) => { if (n) lines.push(`${n} ${text}`); };
+		if (stats.projectsCreated.length) {
+			lines.push(`New projects: ${stats.projectsCreated.join(", ")}`);
+		}
+		add(stats.created, "task(s) added");
+		add(stats.renamed, "task(s) renamed");
+		add(stats.completed, "task(s) completed (issue closed)");
+		add(stats.dropped, "task(s) dropped (issue closed as not planned)");
+		add(stats.unlabeled, `task(s) whose issue no longer has the "${CONFIG.label}" label (left alone)`);
+		add(stats.missing, "task(s) whose issue can't be found (left alone)");
+		add(stats.untracked, `labeled issue(s) already linked from a task without the "${CONFIG.tag}" tag (left alone)`);
+		return lines.length ? lines.join("\n") : "Everything is up to date.";
+	}
+
+	// ---------------------------------------------------------------------
+	// Token handling
+	// ---------------------------------------------------------------------
+	async function getToken() {
+		const saved = credentials.read(CREDENTIAL_SERVICE);
+		if (saved && saved.password) return saved.password;
+
+		const form = new Form();
+		form.addField(new Form.Field.Password("token", "GitHub token", null));
+		form.validate = f => Boolean(f.values.token && f.values.token.trim());
+		let result;
+		try {
+			result = await form.show(
+				"Enter a GitHub personal access token with read access to issues. It is stored in the keychain.",
+				"Save"
+			);
+		} catch (e) {
+			return null; // cancelled
+		}
+		const token = result.values.token.trim();
+		credentials.write(CREDENTIAL_SERVICE, "github", token);
+		return token;
+	}
+
+	// ---------------------------------------------------------------------
+	// Action
+	// ---------------------------------------------------------------------
+	const action = new PlugIn.Action(async function (selection, sender) {
+		try {
+			const token = await getToken();
+			if (!token) return;
+			const stats = await sync(makeGitHub(token));
+			if (CONFIG.showSummary) {
+				await new Alert("GitHub sync complete", summarize(stats)).show();
+			}
+		} catch (e) {
+			let message = String(e && e.message || e);
+			if (e instanceof AuthError) {
+				credentials.remove(CREDENTIAL_SERVICE);
+				message += " The saved token was cleared; run the sync again to enter a new one.";
+			}
+			await new Alert("GitHub sync failed", message).show();
+		}
+	});
+	action.validate = function (selection, sender) { return true; };
+
+	// Exposed for the Node test harness only; `module` doesn't exist in OmniFocus.
+	if (typeof module !== "undefined" && module.exports) {
+		module.exports = { CONFIG, sync, summarize, makeGitHub, nextLink, issueKeyFromText, repoKeyFromText, action, AuthError };
+	}
+
+	return action;
+})();
